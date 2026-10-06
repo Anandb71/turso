@@ -53,7 +53,7 @@ macro_rules! scalar_functions {
 
 scalar_functions! {
     Acldefault(FunctionArity::Exact(2), true),
-    PgGetUserbyid(FunctionArity::Exact(1), true),
+    PgGetUserbyid(FunctionArity::Exact(1), false),
     PgTableIsVisible | PgFunctionIsVisible | PgTypeIsVisible(FunctionArity::Exact(1), true),
     PgEncodingToChar(FunctionArity::Exact(1), true),
     PgGetFunctionResult | PgGetFunctionArguments | PgGetStatisticsobjdefColumns | PgRelationIsPublishable(
@@ -92,7 +92,9 @@ impl ScalarCall for PgScalarFunction {
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         let value = match self {
             Self::Acldefault => exec_acl_default(args)?,
-            Self::PgGetUserbyid => oid_arg(args, 0)?.map_or(Value::Null, exec_pg_get_user_by_id),
+            Self::PgGetUserbyid => {
+                oid_arg(args, 0)?.map_or(Value::Null, |oid| exec_pg_get_user_by_id(connection, oid))
+            }
             Self::PgTableIsVisible | Self::PgFunctionIsVisible | Self::PgTypeIsVisible => {
                 oid_arg(args, 0)?.map_or(Value::Null, exec_pg_is_visible)
             }
@@ -383,8 +385,13 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
     }
 }
 
-fn exec_pg_get_user_by_id(_oid: i64) -> Value {
-    Value::build_text("turso")
+fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> Value {
+    let name = crate::catalog::listed_roles(conn)
+        .into_iter()
+        .find(|role| crate::catalog::role_oid(role.id) == oid)
+        .map(|role| role.name)
+        .unwrap_or_else(|| format!("unknown (OID={oid})"));
+    Value::build_text(name)
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Value {
