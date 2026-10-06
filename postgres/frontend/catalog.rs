@@ -901,6 +901,10 @@ impl VirtualTableModule for EmptyPgCatalogTable {
 impl VirtualTable for EmptyPgCatalogTable {
     type Cursor = EmptyPgCatalogCursor;
 
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(EmptyPgCatalogCursor)
     }
@@ -1957,9 +1961,14 @@ impl SnapshotRows for PgSequencesTable {
                 let seq_name = seq.name.clone();
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
-                let last_val = conn
-                    .get_sequence_currval(&seq_name)
-                    .unwrap_or(seq.start_value);
+                let last_value = if conn.current_role_is_superuser() {
+                    Value::from_i64(
+                        conn.get_sequence_currval(&seq_name)
+                            .unwrap_or(seq.start_value),
+                    )
+                } else {
+                    Value::Null
+                };
                 rows.push(vec![
                     Value::build_text("public"),             // schemaname
                     Value::build_text(seq_name),             // sequencename
@@ -1971,7 +1980,7 @@ impl SnapshotRows for PgSequencesTable {
                     Value::from_i64(seq.increment_by),       // increment_by
                     Value::from_i64(i64::from(seq.cycle)),   // cycle
                     Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
-                    Value::from_i64(last_val), // last_value
+                    last_value,         // last_value
                 ]);
             }
         }
@@ -2241,6 +2250,10 @@ impl<T: SnapshotRows> VirtualTableModule for SnapshotCatalog<T> {
 impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
     type Cursor = SnapshotCursor;
 
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(SnapshotCursor {
             conn,
@@ -2448,6 +2461,10 @@ impl VirtualTableCursor for PgInputErrorInfoCursor {
 
 impl VirtualTable for PgInputErrorInfoTable {
     type Cursor = PgInputErrorInfoCursor;
+
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
 
     fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(PgInputErrorInfoCursor::new())
@@ -2672,6 +2689,10 @@ impl VirtualTableCursor for PgGetTableDefCursor {
 
 impl VirtualTable for PgGetTableDefTable {
     type Cursor = PgGetTableDefCursor;
+
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
 
     fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(PgGetTableDefCursor::new(conn))
