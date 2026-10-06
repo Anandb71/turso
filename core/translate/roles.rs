@@ -167,6 +167,12 @@ pub fn check_storage_access(
     {
         return Ok(());
     }
+    if let Some(view_name) = program.referenced_views.first() {
+        return Err(permission_denied(PermissionDenied::privilege(
+            Action::Read,
+            Object::View(view_name.clone()),
+        )));
+    }
     for (insn, _) in &program.insns {
         let (action, db, root_page) = match insn {
             Insn::OpenRead { db, root_page, .. } => (Action::Read, *db, Some(*root_page)),
@@ -551,6 +557,26 @@ mod tests {
             denial(error),
             PermissionDenied::privilege(Action::Read, Object::Table("t".to_string()))
         );
+    }
+
+    #[test]
+    fn role_without_privileges_cannot_read_views() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("CREATE VIEW over_table AS SELECT x FROM t")
+            .unwrap();
+        conn.execute("CREATE VIEW constant AS SELECT 'secret' AS value")
+            .unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        for view in ["over_table", "constant"] {
+            let error = conn.execute(format!("SELECT * FROM {view}")).unwrap_err();
+            assert_eq!(
+                denial(error),
+                PermissionDenied::privilege(Action::Read, Object::View(view.to_string()))
+            );
+        }
     }
 
     #[test]
