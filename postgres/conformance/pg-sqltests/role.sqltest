@@ -25,6 +25,13 @@ expect {
     unknown (OID=0)
 }
 
+test pg-get-userbyid-accepts-quoted-oid {
+    SELECT pg_get_userbyid('10');
+}
+expect {
+    postgres
+}
+
 test bootstrap-superuser-bypasses-row-level-security {
     SELECT count(*) FROM pg_roles WHERE oid = 10 AND rolbypassrls;
 }
@@ -38,6 +45,18 @@ test create-role-does-not-bypass-row-level-security {
 }
 expect {
     1
+}
+
+test pg-get-expr-shows-role-defaults-as-keywords {
+    CREATE TABLE cu_role_defaults (owner TEXT DEFAULT current_user, creator TEXT DEFAULT session_user);
+    SELECT pg_get_expr(d.adbin, d.adrelid)
+    FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid
+    WHERE c.relname = 'cu_role_defaults'
+    ORDER BY d.adnum;
+}
+expect {
+    CURRENT_USER
+    SESSION_USER
 }
 
 test create-role-named-postgres-fails {
