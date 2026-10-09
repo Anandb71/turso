@@ -1983,7 +1983,27 @@ impl PostgreSQLTranslator {
         } else {
             ast::QualifiedName::single(name)
         };
-        Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
+        let columns = range_func
+            .alias
+            .as_ref()
+            .map(|a| a.colnames.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(|node| match &node.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => {
+                    Ok(ast::Name::from_string(&s.sval))
+                }
+                _ => Err(ParseError::ParseError(
+                    "function column alias must be a name".to_owned(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ast::SelectTable::TableCall(
+            qualified_name,
+            args,
+            alias,
+            columns,
+        ))
     }
 
     fn translate_join_expr(
@@ -2017,6 +2037,9 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
                     self.translate_range_subselect(range_sub)?
                 }
+                Some(pg_query::protobuf::node::Node::RangeFunction(range_func)) => {
+                    self.translate_range_function(range_func)?
+                }
                 _ => {
                     return Err(ParseError::ParseError(format!(
                         "Unsupported left side of JOIN: {:?}",
@@ -2047,6 +2070,9 @@ impl PostgreSQLTranslator {
                 }
                 Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
                     self.translate_range_subselect(range_sub)?
+                }
+                Some(pg_query::protobuf::node::Node::RangeFunction(range_func)) => {
+                    self.translate_range_function(range_func)?
                 }
                 _ => {
                     return Err(ParseError::ParseError(format!(
@@ -4166,6 +4192,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_sequences"
             | "pg_constraint"
             | "pg_index"
+            | "pg_statistic_ext"
             | "pg_inherits"
             | "pg_rewrite"
             | "pg_foreign_table"
@@ -4175,6 +4202,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_input_error_info"
             | "pg_get_tabledef"
             | "pg_options_to_table"
+            | "unnest"
             | "pg_settings"
             | "pg_extension"
             | "pg_depend"
@@ -4519,8 +4547,7 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
-        // For CAST expressions, map all text-like PG types to TEXT and
-        // boolean to INTEGER for SQLite VDBE compatibility
+        "BOOLEAN" | "BOOL" if !type_name.array_bounds.is_empty() => "BOOLEAN",
         "BOOLEAN" | "BOOL" => "INTEGER",
         "DATE" => "date",
         "TIME" | "TIMETZ" => "time",
@@ -4537,7 +4564,7 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
     Some(ast::Type {
         name: name.to_string(),
         size: None,
-        array_dimensions: 0,
+        array_dimensions: type_name.array_bounds.len() as u32,
     })
 }
 
