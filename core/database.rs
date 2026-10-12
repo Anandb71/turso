@@ -487,6 +487,7 @@ enum StatsRefresh {
 
 /// Settings for a single connection, passed to [`Database::connect`] and
 /// [`Database::connect_async`].
+#[derive(Clone)]
 pub struct ConnectOpts {
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
