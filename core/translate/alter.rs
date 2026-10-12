@@ -833,7 +833,7 @@ fn emit_add_column_check_validation(
         // constraint name, or the expression's source text as written.
         let name = match (constraint_name, check_source) {
             (Some(name), _) => name.clone(),
-            (None, Some(source)) => crate::util::check_source_for_error(source),
+            (None, Some(source)) => crate::util::dequote(source),
             (None, None) => format!("{check_expr}"),
         };
         program.emit_insn(Insn::Halt {

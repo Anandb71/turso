@@ -263,3 +263,54 @@ fn test_alter_table_add_column_preserves_collation_on_reopen() {
         conn.close().unwrap();
     }
 }
+
+/// ALTER TABLE rewrites the schema from the table metadata. Type names must be
+/// written as the user wrote them: the dequoted declared type of `[x] INT` is
+/// `x] IN`, which is not valid SQL.
+#[test]
+fn test_alter_table_keeps_type_names_as_written_on_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_table_type_names_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute(
+            "CREATE TABLE t (z, e [x] INT, d \"a\"\"b\" INT, b \"BLOB\" INTEGER, a BLOB/*INT*/REAL)",
+        )
+        .unwrap();
+        conn.execute("ALTER TABLE t DROP COLUMN z").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN f \"c\"\"d\" TEXT")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let schema: Vec<(String,)> =
+            conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+        assert_eq!(
+            schema,
+            vec![(
+                "CREATE TABLE t (e [x] INT, d \"a\"\"b\" INT, b \"BLOB\" INTEGER, a BLOB/*INT*/REAL, f \"c\"\"d\" TEXT)"
+                    .to_string(),
+            )]
+        );
+
+        let declared_types: Vec<(String,)> =
+            conn.exec_rows("SELECT type FROM pragma_table_info('t')");
+        assert_eq!(
+            declared_types,
+            vec![
+                ("x] IN".to_string(),),
+                ("a\"b".to_string(),),
+                ("BLOB".to_string(),),
+                ("BLOB/*INT*/REAL".to_string(),),
+                ("c\"d".to_string(),),
+            ]
+        );
+        conn.close().unwrap();
+    }
+}
