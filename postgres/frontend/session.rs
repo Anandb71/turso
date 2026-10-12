@@ -1,9 +1,13 @@
+use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::str;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::{self, PostgresDialect};
-use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
+use turso_core::{
+    ConnectOpts, Connection, Database, LimboError, PrepareOptions, Result, Statement, Value,
+};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
@@ -13,6 +17,30 @@ use turso_pg_parser::translator::{
 
 use crate::copy::parse_copy_text_format;
 
+/// A database opened with the PostgreSQL frontend. Each connection to it is
+/// a session with its own transaction and settings, and sees the schemas
+/// that other sessions create or drop.
+#[derive(Clone)]
+pub struct PgDatabase {
+    db: Arc<Database>,
+    schemas: Arc<SharedSchemas>,
+}
+
+impl PgDatabase {
+    pub fn new(db: Arc<Database>) -> Self {
+        Self {
+            db,
+            schemas: Arc::new(SharedSchemas::default()),
+        }
+    }
+
+    /// Opens a session, connecting with `opts`.
+    pub fn connect(&self, opts: ConnectOpts) -> Result<PgConnection> {
+        let conn = self.db.connect(opts)?;
+        Ok(PgConnection::with_schemas(conn, self.schemas.clone()))
+    }
+}
+
 #[derive(Clone)]
 pub struct PgConnection {
     inner: Arc<PgConnectionInner>,
@@ -21,6 +49,7 @@ pub struct PgConnection {
 struct PgConnectionInner {
     conn: Arc<Connection>,
     session_state: Mutex<SessionState>,
+    schemas: Arc<SharedSchemas>,
 }
 
 impl PgConnectionInner {
@@ -28,11 +57,179 @@ impl PgConnectionInner {
         let mut state = self.session_state.lock().unwrap();
         state.search_path = path;
     }
+
+    /// Attaches the database file at `path` as schema `name`, in this session
+    /// and in every other session of the database. Returns false, without
+    /// attaching anything, if another session already added schema `name`.
+    /// The list of schemas stays locked while attaching, so two sessions
+    /// cannot both add the same name.
+    fn add_schema(&self, name: &str, path: &str) -> Result<bool> {
+        let mut list = self.schemas.list.lock().unwrap();
+        if list.schemas.contains_key(name) {
+            return Ok(false);
+        }
+        attach_database(&self.conn, name, path)?;
+        let id = self.schemas.version.fetch_add(1, Ordering::AcqRel) + 1;
+        list.schemas.insert(
+            name.to_string(),
+            SharedSchema {
+                path: path.to_string(),
+                id,
+            },
+        );
+        list.attached(id);
+        self.session_state
+            .lock()
+            .unwrap()
+            .attached_schemas
+            .insert(name.to_string(), id);
+        Ok(true)
+    }
+
+    /// Drops schema `name`, in this session and in every other session of the
+    /// database, and with `cascade` also drops its tables. The list of schemas
+    /// stays locked, so no session can attach the schema or start using it
+    /// while it is dropped. With `delete_file`, the file of the schema is
+    /// deleted once no session has it attached.
+    fn drop_schema(&self, name: &str, cascade: bool, delete_file: bool) -> Result<()> {
+        let mut list = self.schemas.list.lock().unwrap();
+        self.schemas.version.fetch_add(1, Ordering::AcqRel);
+        empty_schema(&self.conn, name, cascade)?;
+        execute_sqlite_internal(&self.conn, format!("DETACH \"{name}\""))?;
+        let schema = list
+            .schemas
+            .remove(name)
+            .expect("a schema attached to a session is in the list of schemas");
+        self.session_state
+            .lock()
+            .unwrap()
+            .attached_schemas
+            .remove(name);
+        list.detached(schema.id);
+        if delete_file {
+            list.delete_file_when_unused(&schema)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PgConnectionInner {
+    fn drop(&mut self) {
+        let state = self.session_state.get_mut().unwrap();
+        let mut list = self.schemas.list.lock().unwrap();
+        for id in state.attached_schemas.values() {
+            list.detached(*id);
+        }
+    }
 }
 
 #[derive(Default)]
 struct SessionState {
     search_path: Vec<String>,
+    /// The `SharedSchemas::version` that this session's attached schemas
+    /// match.
+    schemas_version: u64,
+    /// Name to `SharedSchema::id` of each schema attached to this session.
+    attached_schemas: BTreeMap<String, u64>,
+}
+
+/// The schemas of a database, shared by all of its sessions. A schema is a
+/// database file attached to a connection, and an attachment belongs to one
+/// connection only. Before running a statement, each session attaches the
+/// schemas that other sessions created and detaches the ones they dropped.
+#[derive(Default)]
+struct SharedSchemas {
+    list: Mutex<SchemaList>,
+    /// Incremented whenever the schemas in `list` change.
+    version: AtomicU64,
+}
+
+#[derive(Default)]
+struct SchemaList {
+    /// Schema name to its database file.
+    schemas: BTreeMap<String, SharedSchema>,
+    /// `SharedSchema::id` to the number of sessions that have the schema
+    /// attached, for schemas in `schemas` and for dropped schemas.
+    sessions: BTreeMap<u64, usize>,
+    /// `SharedSchema::id` of a dropped schema that sessions still have
+    /// attached, to the path its file was moved to. The file is deleted when
+    /// the last of those sessions detaches the schema.
+    dropped_files: BTreeMap<u64, String>,
+}
+
+#[derive(Clone)]
+struct SharedSchema {
+    path: String,
+    /// Tells a dropped schema apart from a schema created later with the
+    /// same name and path. DROP SCHEMA moves the file of the dropped schema
+    /// away, so a session that still has it attached must attach the new
+    /// file.
+    id: u64,
+}
+
+impl SchemaList {
+    fn attached(&mut self, id: u64) {
+        *self.sessions.entry(id).or_insert(0) += 1;
+    }
+
+    /// Records that a session detached the schema with `SharedSchema::id`
+    /// `id`, and deletes the file of a dropped schema that no session has
+    /// attached anymore.
+    fn detached(&mut self, id: u64) {
+        let sessions = self
+            .sessions
+            .get_mut(&id)
+            .expect("a schema attached to a session has a session count");
+        *sessions -= 1;
+        if *sessions > 0 {
+            return;
+        }
+        self.sessions.remove(&id);
+        if let Some(path) = self.dropped_files.remove(&id) {
+            delete_database_files(&path);
+        }
+    }
+
+    /// Deletes the file of dropped schema `schema` if no session has it
+    /// attached. Otherwise moves the file away, so that the sessions that
+    /// still have it attached can keep using it until they notice the drop,
+    /// and a schema created later with the same name gets a new file.
+    fn delete_file_when_unused(&mut self, schema: &SharedSchema) -> Result<()> {
+        if !self.sessions.contains_key(&schema.id) {
+            delete_database_files(&schema.path);
+            return Ok(());
+        }
+        let dropped_path = format!("{}.dropped-{}", schema.path, schema.id);
+        for suffix in DATABASE_FILE_SUFFIXES {
+            let from = format!("{}{suffix}", schema.path);
+            let to = format!("{dropped_path}{suffix}");
+            match std::fs::rename(&from, &to) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {}
+                Err(e) => {
+                    return Err(LimboError::InternalError(format!(
+                        "cannot move the file of dropped schema from {from} to {to}: {e}"
+                    )))
+                }
+            }
+        }
+        self.dropped_files.insert(schema.id, dropped_path);
+        Ok(())
+    }
+}
+
+/// Suffixes of the database file and of the files next to it.
+const DATABASE_FILE_SUFFIXES: [&str; 3] = ["", "-wal", "-shm"];
+
+fn delete_database_files(path: &str) {
+    for suffix in DATABASE_FILE_SUFFIXES {
+        let file = format!("{path}{suffix}");
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("Failed to delete {file}: {e}"),
+        }
+    }
 }
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
@@ -72,13 +269,30 @@ pub fn open_database_with_io(
 }
 
 impl PgConnection {
+    /// Wraps a connection that does not share schemas with other sessions.
+    /// Use [`PgDatabase::connect`] to open sessions that do.
     pub fn new(conn: Arc<Connection>) -> Self {
+        Self::with_schemas(conn, Arc::new(SharedSchemas::default()))
+    }
+
+    fn with_schemas(conn: Arc<Connection>, schemas: Arc<SharedSchemas>) -> Self {
         Self {
             inner: Arc::new(PgConnectionInner {
                 conn,
                 session_state: Mutex::new(SessionState::default()),
+                schemas,
             }),
         }
+    }
+
+    /// Attaches an existing schema database file as schema `name`, in this
+    /// session and in every other session of the database.
+    pub fn attach_schema(&self, name: &str, path: &str) -> Result<()> {
+        let name = name.to_lowercase();
+        if !self.inner.add_schema(&name, path)? {
+            return Err(schema_already_exists(&name));
+        }
+        Ok(())
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
@@ -173,6 +387,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     }
 
     reject_sqlite_catalog_access(sql)?;
+    attach_schemas_of_other_sessions(pg_conn, sql)?;
 
     if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
         return Ok(stmt);
@@ -204,6 +419,73 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     pg_conn
         .conn
         .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
+}
+
+/// Attaches the schemas that other sessions created and detaches the ones
+/// they dropped, before running `sql`. A database cannot be attached or
+/// detached inside a transaction, so a session inside a transaction keeps
+/// its schemas until the transaction ends. If another session dropped one
+/// of them, its file is deleted, and writes to it would be lost, so the
+/// session can only end the transaction.
+fn attach_schemas_of_other_sessions(pg_conn: &PgConnectionInner, sql: &str) -> Result<()> {
+    let version = pg_conn.schemas.version.load(Ordering::Acquire);
+    if pg_conn.session_state.lock().unwrap().schemas_version == version {
+        return Ok(());
+    }
+    let mut list = pg_conn.schemas.list.lock().unwrap();
+    let version = pg_conn.schemas.version.load(Ordering::Acquire);
+    let mut state = pg_conn.session_state.lock().unwrap();
+    let wanted = list.schemas.clone();
+    let dropped: Vec<String> = state
+        .attached_schemas
+        .iter()
+        .filter(|(name, id)| wanted.get(*name).map(|schema| schema.id) != Some(**id))
+        .map(|(name, _)| name.clone())
+        .collect();
+    if !pg_conn.conn.get_auto_commit() {
+        if let Some(name) = dropped.first() {
+            if !ends_transaction(sql) {
+                return Err(LimboError::TxError(format!(
+                    "schema \"{name}\" was dropped by another session, roll back the transaction"
+                )));
+            }
+        }
+        return Ok(());
+    }
+    for name in &dropped {
+        execute_sqlite_internal(&pg_conn.conn, format!("DETACH \"{name}\""))?;
+        let id = state
+            .attached_schemas
+            .remove(name)
+            .expect("a dropped schema is attached to the session");
+        list.detached(id);
+    }
+    for (name, schema) in &wanted {
+        if !state.attached_schemas.contains_key(name) {
+            attach_database(&pg_conn.conn, name, &schema.path)?;
+            state.attached_schemas.insert(name.clone(), schema.id);
+            list.attached(schema.id);
+        }
+    }
+    state.schemas_version = version;
+    Ok(())
+}
+
+fn ends_transaction(sql: &str) -> bool {
+    let Ok(parse_result) = turso_pg_parser::parse(sql) else {
+        return false;
+    };
+    let Ok(translated) = PostgreSQLTranslator::new().translate_with_prereqs(&parse_result) else {
+        return false;
+    };
+    matches!(
+        translated.cmd.stmt(),
+        ast::Stmt::Commit { .. }
+            | ast::Stmt::Rollback {
+                savepoint_name: None,
+                ..
+            }
+    )
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
@@ -262,12 +544,12 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
-        handle_pg_create_schema(&pg_conn.conn, &stmt)?;
+        handle_pg_create_schema(pg_conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if let Some(stmt) = try_extract_drop_schema(&parse_result) {
-        handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
+        handle_pg_drop_schema(pg_conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
@@ -298,6 +580,13 @@ fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Resu
     stmt.run_ignore_rows()
 }
 
+fn attach_database(conn: &Arc<Connection>, name: &str, path: &str) -> Result<()> {
+    execute_sqlite_internal(
+        conn,
+        format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
+    )
+}
+
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
     if set_stmt.name == "search_path" {
         let path = set_stmt
@@ -316,32 +605,28 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     pg_conn.conn.prepare(&pragma_sql)
 }
 
-fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
+fn handle_pg_create_schema(pg_conn: &PgConnectionInner, stmt: &PgCreateSchemaStmt) -> Result<()> {
+    let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
     if name == "public" {
         if stmt.if_not_exists {
             return Ok(());
         }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" already exists"
-        )));
-    }
-
-    if schema_exists(conn, &name)? {
-        if stmt.if_not_exists {
-            return Ok(());
-        }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" already exists"
-        )));
+        return Err(schema_already_exists(&name));
     }
 
     let path = schema_file_path(conn, &name);
-    execute_sqlite_internal(
-        conn,
-        format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
-    )?;
+    if schema_exists(conn, &name)? || !pg_conn.add_schema(&name, &path)? {
+        if stmt.if_not_exists {
+            return Ok(());
+        }
+        return Err(schema_already_exists(&name));
+    }
     Ok(())
+}
+
+fn schema_already_exists(name: &str) -> LimboError {
+    LimboError::ParseError(format!("schema \"{name}\" already exists"))
 }
 
 fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
@@ -357,7 +642,8 @@ fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
     }
 }
 
-fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Result<()> {
+fn handle_pg_drop_schema(pg_conn: &PgConnectionInner, stmt: &PgDropSchemaStmt) -> Result<()> {
+    let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
     if name == "public" {
         return handle_pg_drop_schema_public(conn, stmt.cascade);
@@ -372,12 +658,31 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
         )));
     }
 
-    if stmt.cascade {
-        drop_all_tables_in_schema(conn, &name)?;
-    }
+    pg_conn.drop_schema(&name, stmt.cascade, conn.db_file_path() != ":memory:")
+}
 
-    execute_sqlite_internal(conn, format!("DETACH \"{name}\""))?;
-    Ok(())
+/// With `cascade`, drops the tables of schema `name`. Runs in a write
+/// transaction that also creates and drops a table, so that it always takes
+/// the write lock of the schema, and fails with "database is busy" if another
+/// session has uncommitted writes to the schema. Without the lock, those
+/// writes would be committed to the file of the dropped schema.
+fn empty_schema(conn: &Arc<Connection>, name: &str, cascade: bool) -> Result<()> {
+    let execute = |sql: String| conn.prepare_sqlite(sql)?.run_ignore_rows();
+    execute("BEGIN".to_string())?;
+    let result = (|| {
+        execute(format!(
+            "CREATE TABLE \"{name}\".__turso_pg_drop_schema (x int)"
+        ))?;
+        execute(format!("DROP TABLE \"{name}\".__turso_pg_drop_schema"))?;
+        if cascade {
+            drop_all_tables_in_schema(conn, name)?;
+        }
+        execute("COMMIT".to_string())
+    })();
+    if result.is_err() {
+        execute("ROLLBACK".to_string())?;
+    }
+    result
 }
 
 fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result<()> {

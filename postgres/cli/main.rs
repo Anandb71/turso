@@ -44,7 +44,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso_core::{ConnectOpts, DatabaseOpts, LimboError, OpenFlags, Statement, Value};
-use turso_pg::Connection;
+use turso_pg::{Connection, PgDatabase};
 use turso_pg_server::TursoPgServer;
 
 // ---------------------------------------------------------------------------
@@ -118,7 +118,7 @@ fn open_database(
 
     let (io, db) =
         turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts.turso_cli())?;
-    let conn = Connection::new(db.connect(ConnectOpts::new())?);
+    let conn = PgDatabase::new(db).connect(ConnectOpts::new())?;
     Ok((io, conn))
 }
 
@@ -146,9 +146,8 @@ fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
             continue;
         };
         let path = entry.path().to_string_lossy().to_string();
-        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
         tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
-        if let Err(e) = conn.inner().execute(&sql) {
+        if let Err(e) = conn.attach_schema(schema, &path) {
             tracing::warn!("Failed to attach schema '{}': {}", schema, e);
         }
     }
