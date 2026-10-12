@@ -153,7 +153,9 @@ fn load_n_rows(n: usize) -> Loaded {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     exec(&conn, &db, "PRAGMA journal_mode = 'mvcc'");
     exec(&conn, &db, "PRAGMA mvcc_checkpoint_threshold = -1");
     exec(&conn, &db, "PRAGMA synchronous = OFF");
