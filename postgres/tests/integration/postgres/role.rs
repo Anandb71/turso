@@ -188,7 +188,7 @@ fn set_role_inside_transaction_block_fails() {
 
     assert_eq!(
         error.to_string(),
-        "SET ROLE inside a transaction block is not supported"
+        "Transaction error: SET ROLE inside a transaction block is not supported"
     );
     assert_eq!(current_user(&conn), "postgres");
 }
