@@ -851,3 +851,17 @@ test affinity-strict-quoted-type-name {
 expect {
     integer|text
 }
+
+test affinity-strict-type-name-with-quotes-and-more-words {
+    CREATE TABLE t (a "INT" X) STRICT;
+}
+expect error {
+    unknown datatype for t.a: "INT"
+}
+
+test affinity-strict-single-quoted-type-name-with-more-words {
+    CREATE TABLE t (a 'TEXT' INT) STRICT;
+}
+expect error {
+    unknown datatype for t.a: "TEXT"
+}

@@ -150,15 +150,22 @@ pub fn identifier_token_for_error(name: &turso_parser::ast::Name) -> String {
 /// quote characters before its last character loses its first and last
 /// characters, so `[x] INT` becomes `x] IN`. Other names go through [dequote].
 pub fn column_declared_type(type_name: &str) -> String {
+    match strip_type_name_quotes(type_name) {
+        Some(stripped) => stripped.to_string(),
+        None => dequote(type_name),
+    }
+}
+
+pub fn strip_type_name_quotes(type_name: &str) -> Option<&str> {
     let is_quote = |b: &u8| matches!(b, b'"' | b'\'' | b'[' | b'`');
     let bytes = type_name.as_bytes();
     if bytes.len() >= 3 && is_quote(&bytes[0]) && !bytes[1..bytes.len() - 1].iter().any(is_quote) {
         let mut chars = type_name.chars();
         chars.next();
         chars.next_back();
-        return chars.as_str().to_string();
+        return Some(chars.as_str());
     }
-    dequote(type_name)
+    None
 }
 
 /// Removes the quotes around the start of `source` the way SQLite's

@@ -24,7 +24,7 @@ use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
     column_declared_type, dequote, escape_sql_string_literal, normalize_ident, quote_identifier,
-    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    strip_type_name_quotes, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
@@ -792,7 +792,9 @@ fn validate(
         for c in columns {
             if let Some(ref col_type) = c.col_type {
                 let type_name = &column_declared_type(&col_type.name);
-                let name_bytes = type_name.as_bytes();
+                let name_bytes = strip_type_name_quotes(&col_type.name)
+                    .unwrap_or(&col_type.name)
+                    .as_bytes();
                 let is_builtin = turso_macros::match_ignore_ascii_case!(match name_bytes {
                     b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
                     _ => false,
