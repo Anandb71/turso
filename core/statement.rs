@@ -984,7 +984,11 @@ impl Statement {
             || conn.next_attached_mv_tx().is_some()
             || attached_leaked
             || self.state.auto_txn_cleanup != vdbe::TxnCleanup::None;
-        if conn.get_auto_commit() && has_implicit_txn_state {
+        let txn_belongs_to_another_statement =
+            matches!(self.state.execution_state, ProgramExecutionState::Init)
+                && conn.n_active_root_statements.load(Ordering::SeqCst)
+                    > i32::from(self.counted_as_active_root);
+        if conn.get_auto_commit() && has_implicit_txn_state && !txn_belongs_to_another_statement {
             conn.rollback_current_txn_state(&main_pager, true);
             self.state.auto_txn_cleanup = vdbe::TxnCleanup::None;
         }
@@ -1009,7 +1013,10 @@ impl Statement {
             // Reprepare must not roll back an explicit transaction. SQLite allows
             // reprepare inside a transaction, and uncommitted writes in temp or
             // attached databases remain visible after the statement is retried.
-            if db_id == crate::TEMP_DB_ID || !conn.get_auto_commit() {
+            if db_id == crate::TEMP_DB_ID
+                || !conn.get_auto_commit()
+                || txn_belongs_to_another_statement
+            {
                 continue;
             }
             // Discard any connection-local schema changes for this attached DB

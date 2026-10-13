@@ -515,6 +515,32 @@ mod tests {
     }
 
     #[test]
+    fn set_role_keeps_the_writes_of_a_statement_that_is_returning_rows() {
+        let conn = open_connection();
+        create_role(&conn, "alice").unwrap();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        let mut select = conn.prepare("SELECT 1").unwrap();
+        let mut insert = conn
+            .prepare("INSERT INTO t VALUES (1), (2) RETURNING x")
+            .unwrap();
+        assert!(insert
+            .run_one_step_blocking(|| Ok(()), || Ok(()))
+            .unwrap()
+            .is_some());
+
+        set_role(&conn, "alice").unwrap();
+        select.run_ignore_rows().unwrap();
+        insert.run_ignore_rows().unwrap();
+
+        reset_role(&conn).unwrap();
+        let mut count = conn.prepare("SELECT count(*) FROM t").unwrap();
+        assert_eq!(
+            count.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(2)]]
+        );
+    }
+
+    #[test]
     fn set_role_inside_a_transaction_fails() {
         let conn = open_connection();
         create_role(&conn, "alice").unwrap();
