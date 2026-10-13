@@ -450,7 +450,8 @@ mod tests {
     fn create_role_keeps_the_last_inserted_rowid() {
         let conn = open_connection();
         conn.execute("CREATE TABLE t (x)").unwrap();
-        conn.execute("INSERT INTO t (rowid, x) VALUES (42, 1)").unwrap();
+        conn.execute("INSERT INTO t (rowid, x) VALUES (42, 1)")
+            .unwrap();
 
         create_role(&conn, "alice").unwrap();
 
@@ -495,6 +496,25 @@ mod tests {
     }
 
     #[test]
+    fn set_role_inside_a_transaction_keeps_the_transaction() {
+        let conn = open_connection();
+        create_role(&conn, "alice").unwrap();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        set_role(&conn, "alice").unwrap_err();
+
+        assert!(!conn.get_auto_commit());
+        conn.execute("COMMIT").unwrap();
+        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(1)]]
+        );
+    }
+
+    #[test]
     fn set_role_inside_a_transaction_fails() {
         let conn = open_connection();
         create_role(&conn, "alice").unwrap();
@@ -504,7 +524,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "SET ROLE inside a transaction block is not supported"
+            "Transaction error: SET ROLE inside a transaction block is not supported"
         );
         assert_eq!(conn.current_role(), RoleId::SUPERUSER);
     }

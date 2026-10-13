@@ -14471,7 +14471,7 @@ pub fn op_set_role(
     load_insn!(SetRole { role_name }, insn);
     let conn = &program.connection;
     if !conn.get_auto_commit() {
-        return Err(LimboError::SqlError(
+        return Err(LimboError::TxError(
             "SET ROLE inside a transaction block is not supported".to_string(),
         )
         .into());
