@@ -646,7 +646,7 @@ fn is_pg_non_query(sql: &str) -> bool {
 }
 
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
-    let upper = query.trim().to_uppercase();
+    let upper = join_leading_words(query).to_uppercase();
     if upper.starts_with("INSERT") {
         Tag::new("INSERT").with_oid(0).with_rows(affected_rows)
     } else if upper.starts_with("UPDATE") {
@@ -707,6 +707,61 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
     }
 }
 
+fn join_leading_words(query: &str) -> String {
+    let mut words = Vec::new();
+    let mut rest = skip_whitespace_and_comments(query);
+    loop {
+        let len = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if len == 0 {
+            break;
+        }
+        words.push(&rest[..len]);
+        rest = skip_whitespace_and_comments(&rest[len..]);
+    }
+    if !rest.is_empty() {
+        words.push(rest.trim_end());
+    }
+    words.join(" ")
+}
+
+fn skip_whitespace_and_comments(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(comment) = sql.strip_prefix("--") {
+            sql = comment.split_once('\n').map_or("", |(_, rest)| rest);
+        } else if sql.starts_with("/*") {
+            sql = skip_nested_block_comment(sql);
+        } else {
+            return sql;
+        }
+    }
+}
+
+fn skip_nested_block_comment(sql: &str) -> &str {
+    let mut depth = 0;
+    let mut i = 0;
+    let bytes = sql.as_bytes();
+    while i + 1 < bytes.len() {
+        match &bytes[i..i + 2] {
+            b"/*" => {
+                depth += 1;
+                i += 2;
+            }
+            b"*/" => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return &sql[i..];
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    ""
+}
+
 /// Whether the statement ends with `WITH NO DATA`, token-wise (ignoring
 /// trailing whitespace and statement terminators).
 fn ends_with_with_no_data(upper: &str) -> bool {
@@ -764,6 +819,24 @@ fn error_info(message: &str) -> ErrorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_tag_ignores_comments_and_line_breaks_between_keywords() {
+        for (query, tag) in [
+            (
+                "-- a comment\nINSERT INTO t VALUES (1)",
+                Tag::new("INSERT").with_oid(0).with_rows(1),
+            ),
+            (
+                "/* a /* nested */ comment */ UPDATE t SET x = 1",
+                Tag::new("UPDATE").with_rows(1),
+            ),
+            ("CREATE\nVIEW v AS SELECT 1", Tag::new("CREATE VIEW")),
+            ("DROP /* a comment */ INDEX i", Tag::new("DROP INDEX")),
+        ] {
+            assert_eq!(command_tag(query, 1), tag, "{query}");
+        }
+    }
 
     #[test]
     fn test_pg_is_in_recovery_returns_true_text_on_wire() {
