@@ -315,3 +315,26 @@ test acldefault-non-ascii-object-kind-errors {
     SELECT acldefault('é', 4294967294);
 }
 expect error {}
+
+test oid-functions-of-null-are-null {
+    SELECT pg_get_userbyid(NULL), pg_table_is_visible(NULL), pg_type_is_visible(NULL),
+           pg_function_is_visible(NULL), format_type(NULL, NULL), pg_get_constraintdef(NULL),
+           pg_get_indexdef(NULL);
+}
+expect {
+    ||||||
+}
+
+test format-type-accepts-quoted-oid {
+    SELECT format_type('23', NULL);
+}
+expect {
+    integer
+}
+
+test oid-function-of-invalid-oid-text-errors {
+    SELECT format_type('abc', NULL);
+}
+expect error {
+    invalid input syntax for type oid: "abc"
+}
