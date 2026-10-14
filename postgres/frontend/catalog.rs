@@ -2276,6 +2276,7 @@ impl SnapshotRows for PgDependTable {
             .map(Vec::as_slice)
             .map(RelationRow::from_row);
 
+        // Report each table's normal dependencies on its schema and access method.
         for relation in relations.clone() {
             if !matches!(relation.kind, RelationKind::Table) {
                 continue;
@@ -2294,6 +2295,8 @@ impl SnapshotRows for PgDependTable {
             }
         }
 
+        // Match automatic indexes to PK/UNIQUE constraints for internal dependencies.
+        // Other indexes have automatic dependencies on their indexed columns.
         for index in indexes.clone() {
             let columns = catalog_column_numbers(index.column_numbers);
             let automatic = relations.clone().any(|relation| {
@@ -2320,6 +2323,7 @@ impl SnapshotRows for PgDependTable {
                     DependencyKind::Internal,
                 ));
             } else {
+                // Emit one automatic dependency row per indexed column.
                 for column_number in columns {
                     rows.push(dependency_row(
                         ObjectAddress::whole::<PgClassTable>(index.oid),
@@ -2330,7 +2334,9 @@ impl SnapshotRows for PgDependTable {
             }
         }
 
+        // Report constraints' dependencies on local columns and foreign-key references.
         for constraint in constraints {
+            // Use automatic dependencies for local columns, or the whole table if none are listed.
             for column_number in catalog_column_numbers(constraint.column_numbers) {
                 rows.push(dependency_row(
                     ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
@@ -2341,6 +2347,7 @@ impl SnapshotRows for PgDependTable {
             if constraint.referenced_table_oid != PG_INVALID_OID {
                 let referenced_columns =
                     catalog_column_numbers(constraint.referenced_column_numbers);
+                // Foreign keys have normal dependencies on their referenced columns.
                 for &column_number in &referenced_columns {
                     rows.push(dependency_row(
                         ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
@@ -2348,6 +2355,7 @@ impl SnapshotRows for PgDependTable {
                         DependencyKind::Normal,
                     ));
                 }
+                // Also report a normal dependency on a matching unique index for the referenced key.
                 if let Some(index) = indexes.clone().find(|index| {
                     index.table_oid == constraint.referenced_table_oid
                         && index.is_unique
@@ -2367,6 +2375,7 @@ impl SnapshotRows for PgDependTable {
             .iter()
             .map(Vec::as_slice)
             .map(ColumnDefaultRow::from_row);
+        // Default expressions automatically depend on the column that owns them.
         for default in defaults {
             rows.push(dependency_row(
                 ObjectAddress::whole::<PgAttrdefTable>(default.oid),
