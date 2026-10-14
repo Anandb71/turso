@@ -74,6 +74,14 @@ expect {
     cr_listed
 }
 
+test acldefault-names-the-owner-by-role-name {
+    CREATE ROLE cr_owner;
+    SELECT acldefault('n', oid) FROM pg_roles WHERE rolname = 'cr_owner';
+}
+expect {
+    {cr_owner=UC/cr_owner}
+}
+
 test create-role-is-not-superuser-and-cannot-log-in {
     CREATE ROLE cr_defaults;
     SELECT count(*) FROM pg_roles

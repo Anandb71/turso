@@ -93,7 +93,7 @@ impl ScalarFunction for PgScalarFunction {
 impl ScalarCall for PgScalarFunction {
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         let value = match self {
-            Self::Acldefault => exec_acl_default(args)?,
+            Self::Acldefault => exec_acl_default(connection, args)?,
             Self::PgGetUserbyid => {
                 oid_arg(args, 0)?.map_or(Value::Null, |oid| exec_pg_get_user_by_id(connection, oid))
             }
@@ -150,7 +150,7 @@ impl ScalarCall for PgScalarFunction {
     }
 }
 
-fn exec_acl_default(args: &[Register]) -> Result<Value> {
+fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Value> {
     if matches!(args[0].get_value(), Value::Null) || matches!(args[1].get_value(), Value::Null) {
         return Ok(Value::Null);
     }
@@ -178,13 +178,7 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
-    // TODO: This hardcoded role mapping is temporary pg_dump compatibility.
-    // Replace it with a real role OID-to-name lookup later. Keep the numeric fallback for unknown OIDs.
-    let role = if owner == 10 {
-        "turso".to_string()
-    } else {
-        owner.to_string()
-    };
+    let role = role_name_by_oid(conn, owner).unwrap_or_else(|| owner.to_string());
     let mut entries = Vec::with_capacity(2);
     if !public_privileges.is_empty() {
         entries.push(format!("={public_privileges}/{role}"));
@@ -398,12 +392,15 @@ fn role_name(conn: &Connection, role: RoleId) -> Value {
 }
 
 fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> Value {
-    let roles = conn.role_catalog();
-    let name = roles
+    let name = role_name_by_oid(conn, oid).unwrap_or_else(|| format!("unknown (OID={oid})"));
+    Value::build_text(name)
+}
+
+fn role_name_by_oid(conn: &Connection, oid: i64) -> Option<String> {
+    conn.role_catalog()
         .iter()
         .find(|role| role.id != RoleId::PUBLIC && crate::catalog::role_oid(role.id) == oid)
-        .map_or_else(|| format!("unknown (OID={oid})"), |role| role.name.clone());
-    Value::build_text(name)
+        .map(|role| role.name.clone())
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Value {
