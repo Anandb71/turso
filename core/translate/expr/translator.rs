@@ -844,7 +844,7 @@ fn translate_cast_expr(
 
     // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
     let type_affinity = cast_type_name
-        .map(|name| Affinity::affinity(&name))
+        .map(|name| Affinity::of_written_type(&name))
         .unwrap_or(Affinity::Numeric);
     program.emit_insn(Insn::Cast {
         reg: target_register,

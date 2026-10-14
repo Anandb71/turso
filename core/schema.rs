@@ -5735,6 +5735,9 @@ impl Column {
         if written != self.ty_str {
             self.written_ty_str = Some(written.to_string());
         }
+        if self.ty_str.is_empty() {
+            self.override_affinity(Affinity::Numeric);
+        }
     }
 
     #[inline]

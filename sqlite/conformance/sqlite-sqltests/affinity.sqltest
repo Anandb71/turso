@@ -843,6 +843,18 @@ expect {
 }
 
 @cross-check-integrity
+test affinity-type-name-empty-after-quotes-removed {
+    CREATE TABLE t (a "" INT, b "", c);
+    INSERT INTO t VALUES ('12', '12', '12');
+    SELECT typeof(a), typeof(b), typeof(c) FROM t;
+    SELECT typeof(CAST('12' AS "")), typeof(CAST('12' AS "") + 0);
+}
+expect {
+    integer|integer|text
+    integer|integer
+}
+
+@cross-check-integrity
 test affinity-strict-quoted-type-name {
     CREATE TABLE t (a "INT", b [TEXT]) STRICT;
     INSERT INTO t VALUES ('1', 'x');
