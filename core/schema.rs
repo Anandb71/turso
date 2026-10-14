@@ -777,6 +777,8 @@ pub struct Schema {
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
     pub sequences: HashMap<String, Arc<Sequence>>,
+
+    pub tables_with_quoted_integer_primary_key: HashMap<String, Arc<BTreeTable>>,
 }
 
 impl Default for Schema {
@@ -919,6 +921,7 @@ impl Schema {
             type_registry,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
+            tables_with_quoted_integer_primary_key: HashMap::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -1807,13 +1810,27 @@ impl Schema {
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
             // Hence, we can process the singles first (unique_set.columns.len() == 1), and then the compounds (unique_set.columns.len() > 1).
-            let table = self.get_btree_table(&automatic_index.0).ok_or_else(|| {
+            let mut table = self.get_btree_table(&automatic_index.0).ok_or_else(|| {
                 LimboError::Corrupt(format!(
                     "sqlite_schema contains automatic index for missing table '{}': indexes={:?}",
                     automatic_index.0, automatic_index.1
                 ))
             })?;
             let mut automatic_indexes = automatic_index.1;
+            if let Some(old_table) = self
+                .tables_with_quoted_integer_primary_key
+                .get(&normalize_ident(&table.name))
+            {
+                if automatic_indexes.len() != table.unique_sets.len()
+                    && automatic_indexes.len() == old_table.unique_sets.len()
+                {
+                    table = Arc::clone(old_table);
+                    self.tables.insert(
+                        normalize_ident(&table.name),
+                        Table::BTree(Arc::clone(&table)).into(),
+                    );
+                }
+            }
             automatic_indexes.reverse(); // reverse so we can pop() without shifting array elements, while still processing in left-to-right order
 
             // we must process unique_sets in this exact order in order to emit automatic indices schema entries in the same order
@@ -1913,6 +1930,7 @@ impl Schema {
                 );
             }
         }
+        self.tables_with_quoted_integer_primary_key.clear();
         Ok(())
     }
 
@@ -2188,6 +2206,14 @@ impl Schema {
                     let mut table = table;
                     table.resolve_custom_type_affinities(self);
                     table.propagate_domain_constraints(self)?;
+                    if table.rowid_alias_needs_type_quotes_removed() {
+                        let mut old_table =
+                            BTreeTable::from_sql_keeping_type_quotes(sql, root_page)?;
+                        old_table.resolve_custom_type_affinities(self);
+                        old_table.propagate_domain_constraints(self)?;
+                        self.tables_with_quoted_integer_primary_key
+                            .insert(normalize_ident(&table.name), Arc::new(old_table));
+                    }
                     let has_autoinc = table.has_autoincrement;
                     let tbl_name = table.name.clone();
                     self.add_btree_table(Arc::new(table))?;
@@ -2867,6 +2893,9 @@ impl TryClone for Schema {
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
+            tables_with_quoted_integer_primary_key: self
+                .tables_with_quoted_integer_primary_key
+                .try_clone()?,
         })
     }
 }
@@ -3563,6 +3592,15 @@ impl BTreeTable {
     /// Returns None if the column name is not found.
     /// E.g. if table is CREATE TABLE t (a, b, c)
     /// then get_column("b") returns (1, &Column { .. })
+    fn rowid_alias_needs_type_quotes_removed(&self) -> bool {
+        self.get_rowid_alias_column().is_some_and(|(_, column)| {
+            column
+                .written_ty_str
+                .as_deref()
+                .is_some_and(|written| !type_from_name(written).1)
+        })
+    }
+
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
         self.columns.iter().enumerate().find(|(_, column)| {
             column
@@ -3573,11 +3611,28 @@ impl BTreeTable {
     }
 
     pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
+        Self::from_sql_with_rowid_alias_rule(sql, root_page, RowidAliasRule::TypeQuotesRemoved)
+    }
+
+    fn from_sql_keeping_type_quotes(sql: &str, root_page: i64) -> Result<BTreeTable> {
+        Self::from_sql_with_rowid_alias_rule(sql, root_page, RowidAliasRule::TypeQuotesKept)
+    }
+
+    fn from_sql_with_rowid_alias_rule(
+        sql: &str,
+        root_page: i64,
+        rowid_alias_rule: RowidAliasRule,
+    ) -> Result<BTreeTable> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                Self::from_create_table_ast(&tbl_name, &body, root_page)
+                create_table_with_rowid_alias_rule(
+                    tbl_name.name.as_str(),
+                    &body,
+                    root_page,
+                    rowid_alias_rule,
+                )
             }
             Some(Cmd::Stmt(Stmt::CreateVirtualTable(vtab))) => Err(LimboError::Corrupt(format!(
                 "sqlite_schema root_page must be 0 for virtual table {}, got {root_page}",
@@ -4588,6 +4643,21 @@ fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<CollationSe
 }
 
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
+    create_table_with_rowid_alias_rule(tbl_name, body, root_page, RowidAliasRule::TypeQuotesRemoved)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowidAliasRule {
+    TypeQuotesRemoved,
+    TypeQuotesKept,
+}
+
+fn create_table_with_rowid_alias_rule(
+    tbl_name: &str,
+    body: &CreateTableBody,
+    root_page: i64,
+    rowid_alias_rule: RowidAliasRule,
+) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let has_rowid;
@@ -4814,9 +4884,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
 
                 let mut typename_exactly_integer = false;
                 let ty = match col_type {
-                    Some(_) => {
+                    Some(written_type) => {
                         let (ty, ei) = type_from_name(&ty_str);
-                        typename_exactly_integer = ei;
+                        typename_exactly_integer = match rowid_alias_rule {
+                            RowidAliasRule::TypeQuotesRemoved => ei,
+                            RowidAliasRule::TypeQuotesKept => type_from_name(&written_type.name).1,
+                        };
                         ty
                     }
                     None => Type::Null,

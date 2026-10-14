@@ -314,3 +314,64 @@ fn test_alter_table_keeps_type_names_as_written_on_reopen() {
         conn.close().unwrap();
     }
 }
+
+/// Older Turso versions kept the quotes in `a "INTEGER" PRIMARY KEY`, so the
+/// column was not a rowid alias and the table got an automatic index for the
+/// primary key. Such a database must still open, and `a` must keep its stored
+/// values instead of reading the rowid.
+#[test]
+fn test_quoted_integer_primary_key_with_automatic_index_reopen() {
+    for quoted_type in ["\"INTEGER\"", "'INTEGER'"] {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("quoted_integer_primary_key.db");
+
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite
+            .execute_batch(&format!(
+                "CREATE TABLE t(a INT PRIMARY KEY, b TEXT);
+                 INSERT INTO t VALUES (10, 'x'), (20, 'y');
+                 PRAGMA writable_schema = ON;
+                 UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a {} PRIMARY KEY, b TEXT)'
+                  WHERE name = 't';",
+                quoted_type.replace('\'', "''")
+            ))
+            .unwrap();
+        drop(sqlite);
+
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let rows: Vec<(i64, i64, String)> = conn.exec_rows("SELECT rowid, a, b FROM t ORDER BY a");
+        assert_eq!(rows, vec![(1, 10, "x".into()), (2, 20, "y".into())]);
+
+        assert!(conn.execute("INSERT INTO t VALUES (10, 'z')").is_err());
+        conn.execute("INSERT INTO t VALUES (30, 'z')").unwrap();
+
+        let rows: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM t WHERE a = 30");
+        assert_eq!(rows, vec![(30, "z".into())]);
+
+        conn.execute("ALTER TABLE t ADD COLUMN c").unwrap();
+        conn.execute("INSERT INTO t VALUES (40, 'w', 1)").unwrap();
+        conn.close().unwrap();
+        drop(db);
+
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let rows: Vec<(i64, i64, String)> = conn.exec_rows("SELECT rowid, a, b FROM t ORDER BY a");
+        assert_eq!(
+            rows,
+            vec![
+                (1, 10, "x".into()),
+                (2, 20, "y".into()),
+                (3, 30, "z".into()),
+                (4, 40, "w".into()),
+            ]
+        );
+        assert!(conn.execute("INSERT INTO t VALUES (40, 'v', 2)").is_err());
+
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+        conn.close().unwrap();
+    }
+}
